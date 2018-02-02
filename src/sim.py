@@ -17,10 +17,14 @@ import rospy
 from sonars import Sonars
 import states
 import sys
+import time
 import util as u
+
+NUM_ACTIONS = 4  # TODO shared with policy_runner
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--robot-id', type=int, default=0)
+parser.add_argument('--num-sonars', type=int, default=3)
 parser.add_argument('--max-episode-len', type=int, default=1000)
 parser.add_argument('--num-episodes', type=int, default=100000)
 parser.add_argument('--episode-log-file', default="/dev/stdout", 
@@ -32,12 +36,17 @@ parser.add_argument('--sonar-to-state', type=str, default="FurthestSonar",
                     " OrderingSonars / StandardisedSonars")
 parser.add_argument('--state-history-length', type=int, default=0,
                     help="if >1 wrap sonar-to-state in a StateHistory")
+parser.add_argument('--reward', type=str, default="Moving",
+                    help="reward type; Moving or CoarseGrid")
 opts = parser.parse_args()
 print "OPTS", opts
 
 episode_log = open(opts.episode_log_file, "w")
 
-# config sonar -> state transformation
+# wrapper for reading bot sonars
+sonars = Sonars(opts.robot_id, opts.num_sonars)
+
+# mapping from raw sonar readings to some state representation
 if opts.sonar_to_state == "FurthestSonar":
     sonar_to_state = states.FurthestSonar()
 elif opts.sonar_to_state == "OrderingSonars":
@@ -49,14 +58,20 @@ else:
 if opts.state_history_length > 1:
     sonar_to_state = states.StateHistory(sonar_to_state, opts.state_history_length)
 
-# helper for max-distance of sonars
-sonars = Sonars(opts.robot_id)
+# helper for tracking reward based on robot odom. this is closely tied to the reset
+# positioning since coarse grid reward system expects robots to go only clockwise
+# 
+reset_pos = reset_robot_pos.BotPosition(opts.robot_id)
+if opts.reward == "Moving":
+    odom_reward = odom_reward.MovingOdomReward(opts.robot_id)
+    reset_pos_fn = reset_pos.reset_robot_random_pose
+elif opts.reward == "CoarseGrid":
+    odom_reward = odom_reward.CoarseGridOdomReward(opts.robot_id)
+    reset_pos_fn = reset_pos.reset_robot_on_straight_section
+else:
+    raise Exception("unknown --reward %s" % opts.reward)
 
-# helper for tracking reward based on robot odom
-#odom_reward = odom_reward.CoarseGridReward(opts.robot_id)
-odom_reward = odom_reward.MovingOdomReward(opts.robot_id)
-
-# simple dicrete move-forward, turn-left, turn-right control set
+# simple discrete movements; forward, back, left, right
 forward = Twist()
 forward.linear.x = 1.0
 turn_left = Twist()
@@ -71,30 +86,29 @@ training = rospy.Publisher("/drivebot/training_egs", TrainingExample, queue_size
 
 # init ros node
 rospy.init_node("drivebot_sim_%d" % opts.robot_id)
-reset_pos = reset_robot_pos.BotPosition(opts.robot_id)
 
 # wait for service to policy for deciding action
 rospy.wait_for_service("/drivebot/action_given_state")
 action_given_state = rospy.ServiceProxy("/drivebot/action_given_state", ActionGivenState)
 
 # run sim for awhile
+rate = rospy.Rate(5)  # hz
 for episode_id in range(opts.num_episodes):
     # reset robot state
-    reset_pos.reset_robot_random_pose()
+    reset_pos_fn()
     sonars.reset()
     odom_reward.reset()
     sonar_to_state.reset()
 
-    # an episode is a stream of [state_1, action, reward, state_2] events
+    # an episode is a stream of [state_1, discrete_action, reward, state_2] events
     # for a async simulated time system the "gap" between a and r is represented by a
     # 'rate' limited loop for debugging (and more flexible replay) we also keep track
     # of the raw sonar.ranges in the event
+    episode = []
+    event_id = 0
     last_ranges = None
     last_state = None
     last_action = None
-    episode = []
-    rate = rospy.Rate(5)  # hz
-    event_id = 0
     last_reward = None
     # we keep track of runs of 0 rewards as a way of early stopping episode
     no_rewards_run_len = 0
@@ -132,16 +146,17 @@ for episode_id in range(opts.num_episodes):
         # flush a single event to episode and train with it
         if last_state is not None:
             event = OrderedDict()
+            event['bot_id'] = opts.robot_id
             event['epi_id'] = episode_id
             event['eve_id'] = event_id
+            event['time'] = int(time.time())
             event['ranges_1'] = last_ranges
             event['state_1'] = last_state
-            event['action'] = last_action
+            event['discrete_action'] = last_action
             event['reward'] = reward
             event['ranges_2'] = current_ranges
             event['state_2'] = current_state
-            print "EVENT\tepi_id=%s eve_id=%s no_rewards_run_len=%s" % (episode_id, \
-                    event_id, no_rewards_run_len)
+            print "EVENT\te=%s\tno_rewards_run_len=%s" % (event, no_rewards_run_len)
             episode.append(event)
             training.publish(u.training_eg_msg(last_state, last_action, reward,
                                                current_state))
@@ -155,7 +170,7 @@ for episode_id in range(opts.num_episodes):
         # let sim run...
         rate.sleep()
 
-    # write episode to log
+    # write episode to log. use json just to piss everyone off.
     print >>episode_log, json.dumps(episode)
     episode_log.flush()
 

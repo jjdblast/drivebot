@@ -43,16 +43,11 @@ class MovingOdomReward(object):
             self.last_pos = self.latest_pos
             return 0
                 
-        # give reward if any movement made. 
-        if not close(self.latest_pos, self.last_pos):
-            r = 1
-        else:
-            if last_action == 0 :
-                # explictly punish if no movement made and last action was to move forward
-                r = -1
-            else:
-                # no reward, but we're turning, so no reward, but no punishment
-                r = 0
+        # give reward if we asked to move forward and any movement made. 
+        r = 0
+        if last_action == 0:
+            moved = not close(self.latest_pos, self.last_pos)
+            r = 1 if moved else -1
 
         # update last pos
         self.last_pos = self.latest_pos
@@ -67,9 +62,10 @@ class MovingOdomReward(object):
 # HARDCODED TO TRACK1
 class CoarseGridOdomReward(object):
 
-    REWARD_MOVE_FORWARD_A_BIT = 1
-    REWARD_MOVE_FORWARD_ONE_GRID = 0
-    REWARD_MOVE_BACKWARD_ONE_GRID = 0
+    REWARD_STUCK = -1
+    REWARD_MOVE_FORWARD_A_BIT = 0
+    REWARD_MOVE_FORWARD_ONE_GRID = 2
+    REWARD_MOVE_BACKWARD_ONE_GRID = -2
 
     # clockwise around track1 
     GRID_ORDER = [22, 23, 24, 19, 14, 9, 4, 3, 2, 7, 12, 11, 10, 15, 20, 21]
@@ -87,7 +83,7 @@ class CoarseGridOdomReward(object):
     def odom_callback(self, msg):
         self.latest_pos = msg.pose.pose.position
 
-    def reward(self):
+    def reward(self, last_action):
         if self.latest_pos == None:
             # no callbacks yet
             return 0
@@ -98,20 +94,20 @@ class CoarseGridOdomReward(object):
             return 0
                 
         # check indexs of grid points in GRID_ORDER
-        latest_grid_idx = OdomReward.GRID_ORDER.index(grid_pt_for_pos(self.latest_pos))
-        last_grid_idx = OdomReward.GRID_ORDER.index(grid_pt_for_pos(self.last_pos))
+        latest_grid_idx = self.GRID_ORDER.index(grid_pt_for_pos(self.latest_pos))
+        last_grid_idx = self.GRID_ORDER.index(grid_pt_for_pos(self.last_pos))
         r = None
-        wrap = len(OdomReward.GRID_ORDER)
+        wrap = len(self.GRID_ORDER)
         if latest_grid_idx == last_grid_idx:
             # have cross a grid, but at least reward if we've moved
             if close(self.latest_pos, self.last_pos):
-                r = 0
+                r = self.REWARD_STUCK
             else:
-                r = REWARD_MOVE_FORWARD_A_BIT
+                r = self.REWARD_MOVE_FORWARD_A_BIT
         elif latest_grid_idx == (last_grid_idx + 1) % wrap:
-            r = REWARD_MOVE_FORWARD_ONE_GRID
+            r = self.REWARD_MOVE_FORWARD_ONE_GRID
         elif latest_grid_idx == (last_grid_idx - 1) % wrap:
-            r = REWARD_MOVE_BACKWARD_ONE_GRID
+            r = self.REWARD_MOVE_BACKWARD_ONE_GRID
         else:
             # robot has been reset?
             print >>sys.stderr, "odom reward; reset?"
